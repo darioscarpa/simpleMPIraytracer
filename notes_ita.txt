@@ -1,0 +1,151 @@
+----------------------------------------------------------------------
+=== Modifiche alla versione originale (vedesi readme_original.txt) ===
+----------------------------------------------------------------------
+
+1) separato l'aggiornamento della scena (il posizionamento di luce e una delle sfere) dal rendering
+
+2) esposto il buffer usato dalla finestra che visualizza la bitmap in modo da poterlo usare direttamente come output buffer nelle chiamate MPI, evitando copie inutili in memoria
+
+3) precalcoto unitDirs, che veniva ricalcolato uguale a ogni frame
+
+4) rimosso un bug nel ray tracing (possibilità di ricorsione infinita e conseguente stack overflow in caso di superfici riflettenti opposte)
+
+-------------------------------------------------
+=== Note sull'architettura della mia versione ===
+-------------------------------------------------
+
+Dopo l'inizializzazione di MPI, solo il nodo root (ovviamente) apre la GUI e gestisce gli eventi della finestra, mentre gli altri fanno da workers. In DeinoMPI è necessario spuntare "localroot" per permettere l'interazione col desktop. La chiusurà della finestra avvierà anche la terminazione dei workers.
+
+Ogni processo ha una copia della scena, ma questa viene aggiornata solo sul root node. In effetti dato che nell'esempio l'aggiornamento della scena è un banale loop che fa ruotare sfera/luce, ognuno avrebbe potuto calcolare l'aggiornamento indipendentemente, ma mi è sembrato piu' corretto ed interessante implementare questo procedimento:
+a) la scena viene aggiornata sul root node (ipoteticamente in base ad input utente, ad esempio per orientare la camera o spostarsi nella scena)
+b) al momento di renderizzare un frame, il root node manda in broadcast le informazioni necessarie ad aggiornare la copia locale della scena in ogni worker
+c) ogni worker esegue parte del lavoro di rendering, e il master le mette insieme, visualizza il frame nella finestra, e ricomincia il procedimento
+
+In dettaglio, la classe Scene ha due metodi, utilizzati uno sul master per aggiornare la scena e "riempire" un oggetto SceneUpdateData...
+
+// update on the root node and fill SceneUpdateData structure with the new info
+static void updateWorld(const float time, SceneUpdateData *sud);
+
+... e l'altro, chiamato nei worker, per aggiornare la scena in base a quanto ricevuto in input da SceneUpdateData
+
+// update the local copy of the world using data received in the SceneUpdateData struct in input
+static void updateWorldInWorker(SceneUpdateData *sud);
+
+Nella classe Par (Parallelization era troppo typo-sensitive), che contiene le chiamate MPI, ho definito un MPI_Datatype: MPI_UPDATE_MSG.
+
+La conversione tra MPI_UPDATE_MSG e SceneUpdateData avviene nei metodi
+
+void sceneUpdateDataFromMsg(SceneUpdateData *out_sud);
+void sceneUpdateDataToMsg(SceneUpdateData *in_sud);
+
+Nel caso dell'esempio, vengono passati semplicemente le componenti di tre Vec3 (posizione camera, sfera e luce), ma si può facilmente ampliare l'esempio, le modifiche saranno confinate a questi 4 metodi e alla definizione del tipo MPI_UPDATE_MSG e della struttura SceneUpdateData.
+
+Oltre ai vettori, MPI_UPDATE_MSG contiene anche un flag che può ordinare al worker la terminazione.
+(metodi void Par::terminateWorkers() e bool Par::toldToTerminate() )
+
+La logica generica di master e workers è espressa da:
+
+void Par::master(SceneUpdateData *in_sud, unsigned long *out_buf) {
+	sceneUpdateDataToMsg(in_sud);
+	MPI_Bcast( msgData, 1, MPI_UPDATE_MSG, 0, MPI_COMM_WORLD );
+	getFrameFromWorkers(out_buf);
+}
+
+void Par::worker() {
+	SceneUpdateData out_sud;
+	while (true) {		
+		MPI_Bcast( &msgData, 1, MPI_UPDATE_MSG, 0, MPI_COMM_WORLD);
+		if ( toldToTerminate() ) break;
+		sceneUpdateDataFromMsg(&out_sud);
+		Scene::updateWorldInWorker(&out_sud);
+		doWorkForAFrame();
+	}
+}
+
+out_buf, passato a getFrameForWorkers(), è il buffer dei pixel della BMP in memoria che viene visualizzata nella finestra gestita dal root node.
+
+Ho implementato diverse strategie, a caccia di miglioramenti di performance.
+Par è una classe astratta, e ci sono poi varie classi sue eredi che implementano (secondo le diverse strategie) i metodi getFrameForWorkers e doWorkForAFrame, chiamati rispettivamente da master() e worker() per ogni frame.
+
+La classe appropriata viene istanziata a seconda di un parametro da linea di comando che indica la strategia da adottare.
+Per aggiungere una strategia basta modificare il parsing di tale parametro, creare una classe erede di Par che implementi i metodi astratti, e aggiungere l'istanziazione di tale classe nel metodo getInstance di Par. In effetti inizialmente Par era statica, ma per poter avere il binding dinamico necessario all'implementazione delle diverse strategie l'ho resa una sorta di singleton. Strascico dell'implementazione di partenza i metodi init/destroy invece di costruttore e distruttore.
+
+
+---------------------------------------------
+=== Strategie di distribuzione del lavoro ===
+---------------------------------------------
+
+Ho definito come task una "striscia" di frame alta y_size pixel di cui viene assegnato il rendering.
+
+void Scene::renderFrameBlock(int y_start, int y_size, unsigned long *outbuf) 
+Si indica la riga di partenza, il numero di righe da renderizzare, e il buffer di destinazione.
+
+Il buffer della bmp non è che un array di unsigned long, ogni valore rappresenta il colore di un pixel.
+Si può quindi trasferire un buffer contenente un pezzo di frame renderizzato usando MPI_UNSIGNED_LONG.
+
+Si fa sempre in modo, nel master, che le operazioni di ricezione dei dati scrivano direttamente (al posto giusto) nel buffer dell'immagine visualizzata, evitando copie inutili in memoria.
+
+Le varie strategie, con queste fondamenta, possono agire sul modo in cui il master distribuisce le "fasce" di pixel ai workers e finisce con l'ottenere il frame renderizzato, ovvero sui metodi getFrameFromWorkers(out_buf) (nel master) e doWorkForAFrame() (nei worker)
+
+Le classi che implementano le diverse strategie sono così organizzate:
+
+                                 Par
+       ___________________________|_____________________________________________
+      |                 |                                |                      |
+(0)ParSequential  (1)ParSplitAndGather          ParMasterWorkers        (6)ParSplitAdaptive
+                        |	                  ______ |_______________________________
+                  (2)ParSplitAndGatherV          |                     |                 |  
+                                   (3)ParMasterWorkersSimple  (4)ParMasterWorkersAsync  (5)ParMasterWorkersPasv
+
+0) sequential
+Nessuna parallelizzazione: i worker, se presenti, non faranno nulla - il master effettua "da se'" il rendering dell'intero frame.
+E' in pratica il programma di partenza adattato all'architettura della mia implementazione, in modo da poter comodamente confrontare le performance.
+Inoltre consente la corretta esecuzione del programma se avviato direttamente, come singolo processo, e non tramite framework MPI.
+
+1) split_and_gather
+Semplicemente, il frame viene diviso in tante parti (uguali) quanti processi vengono avviati, e ognuno si occupa del rendering di una zona.
+La divsione del buffer è intrinseca nel funzionamento di MPI_gather, e anche il root node processa una parte del frame.
+
+2) spit_and_gatherv
+Variante della prima strategia che esclude il root node dal processing usando gatherv (che definisce diversa distribuzione dell'array ai diversi processi: in questo caso, 0 elementi al nodo 0).
+L'idea alla base di questa variante è che nella strategia 1 il rendering effettuato dal root node non è concorrente agli altri, deve avvenire prima o dopo la gather.
+
+3) workers_pool
+Il frame è diviso in N fasce, con N definito dall'utente tramite un parametro da linea di comando (es: tasks=12).
+Il master assegna i task ai worker fino ad occuparli tutti, e posta delle receive asincrone. Quando una receive termina (si usa waitAny) si invia al worker un nuovo task. Quando si sono inviati tutti i task, si invia un particolare task con un flag che segnala che il rendering del frame è terminato (si interromperà l'attesa di task e ricomincerà l'attesa di broadcast di update della scena).
+
+4) workers_pool_async
+Miglioramento della strategia precendente che usa la comunicazione asincrona anche nella send da parte del worker, e il double buffering. 
+L'idea è che, mentre la send asincrona invia il buffer renderizzato output di un task, il worker può accettarne un altro ed eseguire il rendering concorrentemente all'invio del risultato del precedente. Se il rendering del nuovo task termina prima che sia completata la send del precedente, si attende (e poi si swappano i buffer).
+
+5) workers_pool_pasv
+Variante in cui sono i workers a chiedere esplicitamente un nuovo task appena iniziano l'invio asincrono del buffer del task precedente.
+Idealmente, al costo di un po' di overhead per le richieste di task, il master dovrebbe favorire i worker piu' reattivi/performanti nell'accodamento dei task.
+
+6) adaptive
+Il frame viene diviso in tante parti (task) quanti workers, come nella strategia 2. La dimensione dei task viene pero' progressivamente variata per adattarsi ai tempi di rendering dei workers. Ad esempio, ipotizzando workers di potenza computazionale simile, si avranno fasce di altezza diversa in base a quanto sia oneroso il rendering di una certa zona dell'immagine.
+
+L'esecuzione dell'applicazione dipende da parametri, rapidamente descritti dall'help screen:
+
+strategy=n (default n=1)
+ 0: sequential mode, no parallelization
+ 1: static splitting and gather (root node does rendering too)
+ 2: static splitting and gatherv (no rendering on root node)
+ 3: master/workers: basic, feeds tasks to idle workers
+ 4: master/workers: 3 with task queueing: double buffering, async communication
+ 5: master/workers: as 4, but passive master: workers request tasks when ready
+ 6: adaptive splitting: frame split to balance rendering times
+
+ tasks=n (default n=10)
+  useful only in master/workers strategies
+  defines in how many blocks (tasks) the frame is split
+
+     moveCamera: moves camera, differently dislocating the workload
+  showSplitting: red division lines (yellow area -> rendered on odd ranked node)
+    showConsole: show fps and other stats in a console window
+  enableLogging: each process writes a log useful for profiling
+enableDebugging: each process writes its actions in a verbose debug log
+
+
+In pratica a parte la scelta della strategia e del numero di task, ho aggiunto qualche feature utile a valutare le performance (i fps nella console), visualizzare esplicitamente la divisione del lavoro (showSplitting), e la possibilità di generare dei log (uno con i tempi di rendering e l'altro con le operazioni effettuate).
+

@@ -1,0 +1,20 @@
+exe C:\dati\unison\unisync\PCP\progetto\pcp\simpleraytracer_v1_0\simpleraytracer\winsimpleraytracer.exe
+n 2
+wdir 
+hosts 
+cfg 
+env 
+map 
+channel 
+log no
+localroot yes
+localonly no
+exit_codes no
+credential dusk
+use_cfg no
+use_staging no
+staging_src 
+staging_dest 
+staging_wildcards 
+staging_subdirs no
+staging_pull_files yes
